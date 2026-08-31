@@ -54,6 +54,9 @@ Then:
 2. Use the arrow keys to choose a result.
 3. Press `Tab` on a directory to browse into it.
 4. Press `Enter` or `Tab` on a file to leave `tbnf` and open it in `$EDITOR`.
+   The editor starts with the nearest Git project root as its working directory,
+   while the selected file opens directly. Outside a Git project, the directory
+   where you launched `tbnf` is used.
 5. Press `Enter` on a directory to leave `tbnf` and `cd` there.
 
 Backspace edits the search. When the search is already empty, Backspace moves
@@ -64,6 +67,10 @@ It respects `.gitignore`, `.ignore`, Git's exclude files, and the global Git
 ignore file, and it does not follow symlinked directories. With an empty query,
 the list remains a simple view of the current directory. Recursive indexing is
 disabled at the filesystem root to avoid accidentally walking an entire disk.
+Changing directories cancels the obsolete background scan immediately. Search
+counts every match but retains and sorts only the best 500 results, keeping
+large-tree searches responsive; the header shows both counts when results are
+limited, for example `[1/500 of 2314]`.
 
 The right pane previews the selected file with syntax highlighting. Directories
 show a preview of their contents. Files over 50 KB and binary files are not

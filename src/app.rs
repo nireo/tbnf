@@ -1,11 +1,12 @@
 use std::{
+    collections::BinaryHeap,
     ffi::OsString,
     fs::{self, OpenOptions},
     io,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -20,6 +21,7 @@ use nucleo_matcher::{
 
 const INDEX_BATCH_SIZE: usize = 256;
 const MAX_INDEX_ENTRIES: usize = 500_000;
+const MAX_SEARCH_RESULTS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -29,9 +31,39 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ScoredMatch {
+    index: usize,
+    rank: u8,
+    fuzzy_score: u32,
+    path_lower: String,
+}
+
+impl Ord for ScoredMatch {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Worse matches compare greater, leaving the worst retained match at
+        // the top of the max-heap for cheap replacement.
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| other.fuzzy_score.cmp(&self.fuzzy_score))
+            .then_with(|| self.path_lower.len().cmp(&other.path_lower.len()))
+            .then_with(|| self.path_lower.cmp(&other.path_lower))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for ScoredMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitAction {
-    Edit(PathBuf),
+    Edit {
+        path: PathBuf,
+        working_directory: PathBuf,
+    },
     ChangeDirectory(PathBuf),
 }
 
@@ -113,11 +145,14 @@ pub struct App {
     pub preview_enabled: bool,
     pub indexing: bool,
     pub index_truncated: bool,
+    pub total_matches: usize,
+    launch_directory: PathBuf,
     viewport_height: usize,
     search_entries: Vec<Entry>,
     scan_generation: u64,
     scan_tx: Sender<ScanMessage>,
     scan_rx: Receiver<ScanMessage>,
+    scan_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl App {
@@ -135,13 +170,17 @@ impl App {
             preview_enabled,
             indexing: false,
             index_truncated: false,
+            total_matches: 0,
+            launch_directory: PathBuf::new(),
             viewport_height: 1,
             search_entries: Vec::new(),
             scan_generation: 0,
             scan_tx,
             scan_rx,
+            scan_cancel: None,
         };
         app.switch_dir(cwd)?;
+        app.launch_directory = app.cwd.clone();
         Ok(app)
     }
 
@@ -229,6 +268,7 @@ impl App {
                 } if generation == self.scan_generation => {
                     self.indexing = false;
                     self.index_truncated = truncated;
+                    self.scan_cancel = None;
                     changed = true;
                 }
                 _ => {}
@@ -241,6 +281,7 @@ impl App {
     }
 
     fn start_recursive_index(&mut self) {
+        self.cancel_active_scan();
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.index_truncated = false;
         if self.cwd.parent().is_none() {
@@ -252,6 +293,8 @@ impl App {
         let generation = self.scan_generation;
         let root = self.cwd.clone();
         let tx = self.scan_tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.scan_cancel = Some(Arc::clone(&cancel));
         thread::spawn(move || {
             let count = Arc::new(AtomicUsize::new(0));
             let mut builder = WalkBuilder::new(&root);
@@ -262,12 +305,16 @@ impl App {
             builder.build_parallel().run(|| {
                 let root = root.clone();
                 let count = Arc::clone(&count);
+                let cancel = Arc::clone(&cancel);
                 let mut batch = BatchSender {
                     generation,
                     entries: Vec::with_capacity(INDEX_BATCH_SIZE),
                     tx: tx.clone(),
                 };
                 Box::new(move |result| {
+                    if cancel.load(Ordering::Acquire) {
+                        return WalkState::Quit;
+                    }
                     if count.load(Ordering::Relaxed) >= MAX_INDEX_ENTRIES {
                         return WalkState::Quit;
                     }
@@ -299,11 +346,20 @@ impl App {
                 })
             });
             let truncated = count.load(Ordering::Relaxed) >= MAX_INDEX_ENTRIES;
-            let _ = tx.send(ScanMessage::Done {
-                generation,
-                truncated,
-            });
+            if !cancel.load(Ordering::Acquire) {
+                let _ = tx.send(ScanMessage::Done {
+                    generation,
+                    truncated,
+                });
+            }
         });
+    }
+
+    fn cancel_active_scan(&mut self) {
+        if let Some(cancel) = self.scan_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.indexing = false;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppCommand {
@@ -348,7 +404,7 @@ impl App {
                     let action = if entry.is_dir {
                         ExitAction::ChangeDirectory(entry.path.clone())
                     } else {
-                        ExitAction::Edit(entry.path.clone())
+                        self.edit_action(entry.path.clone())
                     };
                     AppCommand::Exit(Some(action))
                 },
@@ -519,7 +575,7 @@ impl App {
             }
             AppCommand::RefreshPreview
         } else {
-            AppCommand::Exit(Some(ExitAction::Edit(entry.path.clone())))
+            AppCommand::Exit(Some(self.edit_action(entry.path.clone())))
         }
     }
 
@@ -572,6 +628,7 @@ impl App {
     fn rebuild_visible(&mut self) {
         if self.query.is_empty() {
             self.visible = (0..self.entries.len()).collect();
+            self.total_matches = self.visible.len();
         } else {
             let query_lower = self.query.to_lowercase();
             let pattern = Pattern::new(
@@ -581,7 +638,8 @@ impl App {
                 AtomKind::Fuzzy,
             );
             let mut matcher = Matcher::new(Config::DEFAULT);
-            let mut scored = Vec::new();
+            let mut scored = BinaryHeap::with_capacity(MAX_SEARCH_RESULTS + 1);
+            let mut total_matches = 0;
             for (index, entry) in self.search_entries.iter().enumerate() {
                 let mut buffer = Vec::new();
                 let score = pattern.score(
@@ -589,6 +647,7 @@ impl App {
                     &mut matcher,
                 );
                 if let Some(fuzzy_score) = score {
+                    total_matches += 1;
                     let path_lower = entry.display_name.to_lowercase();
                     let name_lower = entry.name.to_string_lossy().to_lowercase();
                     let rank = if path_lower == query_lower || name_lower == query_lower {
@@ -604,16 +663,24 @@ impl App {
                     } else {
                         4
                     };
-                    scored.push((index, rank, fuzzy_score, path_lower));
+                    let candidate = ScoredMatch {
+                        index,
+                        rank,
+                        fuzzy_score,
+                        path_lower,
+                    };
+                    if scored.len() < MAX_SEARCH_RESULTS {
+                        scored.push(candidate);
+                    } else if scored.peek().is_some_and(|worst| candidate < *worst) {
+                        scored.pop();
+                        scored.push(candidate);
+                    }
                 }
             }
-            scored.sort_by(|a, b| {
-                a.1.cmp(&b.1)
-                    .then_with(|| b.2.cmp(&a.2))
-                    .then_with(|| a.3.len().cmp(&b.3.len()))
-                    .then_with(|| a.3.cmp(&b.3))
-            });
-            self.visible = scored.into_iter().map(|item| item.0).collect();
+            let mut scored = scored.into_vec();
+            scored.sort();
+            self.visible = scored.into_iter().map(|item| item.index).collect();
+            self.total_matches = total_matches;
         }
         self.selected = 0;
         self.top_index = 0;
@@ -633,6 +700,21 @@ impl App {
             self.ensure_visible();
         }
     }
+
+    fn edit_action(&self, path: PathBuf) -> ExitAction {
+        let working_directory =
+            project_root_for(&path).unwrap_or_else(|| self.launch_directory.clone());
+        ExitAction::Edit {
+            path,
+            working_directory,
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.cancel_active_scan();
+    }
 }
 
 fn available_scan_threads() -> usize {
@@ -640,6 +722,14 @@ fn available_scan_threads() -> usize {
         .map(usize::from)
         .unwrap_or(2)
         .clamp(1, 4)
+}
+
+fn project_root_for(path: &Path) -> Option<PathBuf> {
+    let directory = if path.is_dir() { path } else { path.parent()? };
+    directory
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -733,6 +823,38 @@ mod tests {
     }
 
     #[test]
+    fn search_retains_only_the_top_results_and_counts_every_match() {
+        let (_temp, mut app) = app_with_files(&[]);
+        app.search_entries = (0..MAX_SEARCH_RESULTS + 50)
+            .map(|index| {
+                let display_name = format!("file-{index:04}.rs");
+                Entry {
+                    name: OsString::from(&display_name),
+                    path: app.cwd.join(&display_name),
+                    display_name,
+                    is_dir: false,
+                }
+            })
+            .collect();
+        app.query = "file".to_owned();
+        app.rebuild_visible();
+
+        assert_eq!(app.visible.len(), MAX_SEARCH_RESULTS);
+        assert_eq!(app.total_matches, MAX_SEARCH_RESULTS + 50);
+        assert_eq!(app.selected_entry().unwrap().display_name, "file-0000.rs");
+    }
+
+    #[test]
+    fn replacement_scan_cancels_the_obsolete_scan() {
+        let (_temp, mut app) = app_with_files(&[]);
+        let obsolete_scan = Arc::clone(app.scan_cancel.as_ref().unwrap());
+
+        app.start_recursive_index();
+
+        assert!(obsolete_scan.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn delete_prompt_targets_the_filtered_selection() {
         let (temp, mut app) = app_with_files(&["keep", "remove-me"]);
         for character in "remove".chars() {
@@ -748,7 +870,7 @@ mod tests {
     #[test]
     fn selecting_a_file_exits_with_an_edit_action() {
         let (_temp, mut app) = app_with_files(&["file.rs"]);
-        let AppCommand::Exit(Some(ExitAction::Edit(path))) =
+        let AppCommand::Exit(Some(ExitAction::Edit { path, .. })) =
             app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
         else {
             panic!("expected edit action");
@@ -759,11 +881,31 @@ mod tests {
     #[test]
     fn enter_on_a_file_exits_with_an_edit_action() {
         let (_temp, mut app) = app_with_files(&["file.rs"]);
-        let AppCommand::Exit(Some(ExitAction::Edit(path))) =
+        let AppCommand::Exit(Some(ExitAction::Edit { path, .. })) =
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         else {
             panic!("expected edit action");
         };
         assert!(path.ends_with("file.rs"));
+    }
+
+    #[test]
+    fn editor_uses_the_nearest_git_project_root() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut app = App::new(temp.path().join("src"), true).unwrap();
+
+        let AppCommand::Exit(Some(ExitAction::Edit {
+            path,
+            working_directory,
+        })) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected edit action");
+        };
+
+        assert!(path.ends_with("src/main.rs"));
+        assert_eq!(working_directory, temp.path().canonicalize().unwrap());
     }
 }

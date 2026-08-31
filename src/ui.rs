@@ -155,6 +155,13 @@ fn header_line(app: &App) -> Line<'static> {
     }
     let count = if app.visible.is_empty() {
         "[0/0]".to_owned()
+    } else if !app.query.is_empty() && app.total_matches > app.visible.len() {
+        format!(
+            "[{}/{} of {}]",
+            app.selected + 1,
+            app.visible.len(),
+            app.total_matches
+        )
     } else {
         format!("[{}/{}]", app.selected + 1, app.visible.len())
     };
