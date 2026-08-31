@@ -6,6 +6,17 @@ the result you want, and either enter its directory or open it in your editor.
 
 ## Install
 
+Build with maximum release optimization, tune for the current CPU, and install
+the executable to `~/.local/bin`:
+
+```sh
+./install.sh
+```
+
+Choose another location with `--bin-dir DIR` or `--prefix DIR`. Use
+`--portable` to build an executable that is not tuned to the current CPU.
+Alternatively, install directly with Cargo:
+
 ```sh
 cargo install --path .
 ```
@@ -72,6 +83,10 @@ counts every match but retains and sorts only the best 500 results, keeping
 large-tree searches responsive; the header shows both counts when results are
 limited, for example `[1/500 of 2314]`.
 
+Hidden files are shown by default. Press `Alt-H` or `F2` to hide or show them;
+the header displays the current state. VCS internals such as `.git/`, `.hg/`,
+and `.svn/` are never recursively indexed.
+
 The right pane previews the selected file with syntax highlighting. Directories
 show a preview of their contents. Files over 50 KB and binary files are not
 rendered. The normal layout gives 40% of the terminal to results and 60% to the
@@ -102,6 +117,7 @@ tbnf --no-preview
 | `Backspace` / `Ctrl-B` | Erase query or go to parent |
 | `Ctrl-W` | Clear query |
 | `Ctrl-E` | Toggle home/root |
+| `Alt-H` / `F2` | Show or hide hidden files |
 | `Ctrl-A` | Create file; append `/` to create a directory |
 | `Ctrl-D` | Delete selected item after confirmation |
 | `Ctrl-O` | Open with the desktop default application |

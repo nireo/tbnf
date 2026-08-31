@@ -29,7 +29,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, preview: &Preview) {
 
     draw_left(frame, left, app);
     if show_preview {
-        frame.render_widget(Paragraph::new(preview.lines.clone()), columns[1]);
+        draw_preview(frame, columns[1], preview);
+    }
+}
+
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, preview: &Preview) {
+    for (offset, line) in preview.lines.iter().take(area.height as usize).enumerate() {
+        let row = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+        frame.render_widget(line, row);
     }
 }
 
@@ -77,46 +84,47 @@ fn draw_left(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(header_line(app)), top);
     }
 
-    let lines = app
+    let mut drew_entry = false;
+    for (offset, entry) in app
         .visible_entries()
         .skip(app.top_index)
         .take(list.height as usize)
         .enumerate()
-        .map(|(offset, entry)| {
-            let index = app.top_index + offset;
-            let mut name = entry.display_name.clone();
-            if entry.is_dir {
-                name.push('/');
+    {
+        drew_entry = true;
+        let index = app.top_index + offset;
+        let style = if index == app.selected && entry.is_dir {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else if index == app.selected {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else if entry.is_dir {
+            Style::default().fg(DIRECTORY_COLOR)
+        } else {
+            Style::default()
+        };
+        let row = Rect::new(list.x, list.y + offset as u16, list.width, 1);
+        frame.render_widget(Span::styled(entry.display_name.as_str(), style), row);
+        if entry.is_dir {
+            let slash_x = row
+                .x
+                .saturating_add(UnicodeWidthStr::width(entry.display_name.as_str()) as u16);
+            if slash_x < row.right() {
+                frame.render_widget(Span::styled("/", style), Rect::new(slash_x, row.y, 1, 1));
             }
-            let style = if index == app.selected && entry.is_dir {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
-            } else if index == app.selected {
-                Style::default().fg(Color::Black).bg(Color::White)
-            } else if entry.is_dir {
-                Style::default().fg(DIRECTORY_COLOR)
-            } else {
-                Style::default()
-            };
-            Line::styled(name, style)
-        })
-        .collect::<Vec<_>>();
+        }
+    }
 
-    if lines.is_empty() {
+    if !drew_entry {
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                "*nothing here*",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Span::styled("*nothing here*", Style::default().fg(Color::DarkGray)),
             list,
         );
-    } else {
-        frame.render_widget(Paragraph::new(lines), list);
     }
 
     if let Some(message) = &app.status {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                message.clone(),
+                message.as_str(),
                 Style::default().fg(Color::Red),
             )),
             status,
@@ -124,12 +132,12 @@ fn draw_left(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn header_line(app: &App) -> Line<'static> {
+fn header_line<'a>(app: &'a App) -> Line<'a> {
     let mut cwd = app.cwd.display().to_string();
     if !cwd.ends_with(std::path::MAIN_SEPARATOR) {
         cwd.push(std::path::MAIN_SEPARATOR);
     }
-    let mut spans = vec![Span::raw(cwd), Span::raw(app.query.clone())];
+    let mut spans = vec![Span::raw(cwd), Span::raw(app.query.as_str())];
     if let Some(entry) = app.selected_entry() {
         let remainder = if app.query.is_empty() {
             Some(entry.display_name.as_str())
@@ -148,7 +156,7 @@ fn header_line(app: &App) -> Line<'static> {
         };
         if let Some(remainder) = remainder {
             spans.push(Span::styled(
-                remainder.to_owned(),
+                remainder,
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -172,8 +180,13 @@ fn header_line(app: &App) -> Line<'static> {
     } else {
         ""
     };
+    let hidden_state = if app.show_hidden {
+        " hidden:on"
+    } else {
+        " hidden:off"
+    };
     spans.push(Span::styled(
-        format!("  {count}{index_state}"),
+        format!("  {count}{index_state}{hidden_state}"),
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),

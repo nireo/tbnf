@@ -143,6 +143,7 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub status: Option<String>,
     pub preview_enabled: bool,
+    pub show_hidden: bool,
     pub indexing: bool,
     pub index_truncated: bool,
     pub total_matches: usize,
@@ -168,6 +169,7 @@ impl App {
             prompt: None,
             status: None,
             preview_enabled,
+            show_hidden: true,
             indexing: false,
             index_truncated: false,
             total_matches: 0,
@@ -245,7 +247,7 @@ impl App {
         self.selected = 0;
         self.top_index = 0;
         self.status = None;
-        self.search_entries = self.entries.clone();
+        self.reset_search_entries();
         self.rebuild_visible();
         self.start_recursive_index();
         Ok(())
@@ -293,6 +295,7 @@ impl App {
         let generation = self.scan_generation;
         let root = self.cwd.clone();
         let tx = self.scan_tx.clone();
+        let show_hidden = self.show_hidden;
         let cancel = Arc::new(AtomicBool::new(false));
         self.scan_cancel = Some(Arc::clone(&cancel));
         thread::spawn(move || {
@@ -300,6 +303,11 @@ impl App {
             let mut builder = WalkBuilder::new(&root);
             builder
                 .min_depth(Some(2))
+                .hidden(!show_hidden)
+                .filter_entry(|entry| {
+                    !entry.file_type().is_some_and(|kind| kind.is_dir())
+                        || !matches!(entry.file_name().to_str(), Some(".git" | ".hg" | ".svn"))
+                })
                 .follow_links(false)
                 .threads(available_scan_threads());
             builder.build_parallel().run(|| {
@@ -423,6 +431,14 @@ impl App {
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_home();
+                AppCommand::RefreshPreview
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.toggle_hidden();
+                AppCommand::RefreshPreview
+            }
+            KeyCode::F(2) => {
+                self.toggle_hidden();
                 AppCommand::RefreshPreview
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -590,6 +606,22 @@ impl App {
         }
     }
 
+    fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.reset_search_entries();
+        self.rebuild_visible();
+        self.start_recursive_index();
+    }
+
+    fn reset_search_entries(&mut self) {
+        self.search_entries = self
+            .entries
+            .iter()
+            .filter(|entry| self.show_hidden || !is_hidden(entry.name.as_os_str()))
+            .cloned()
+            .collect();
+    }
+
     fn backspace(&mut self, full_query: bool) {
         if self.query.is_empty() {
             if let Some(parent) = self.cwd.parent().map(Path::to_path_buf)
@@ -627,7 +659,14 @@ impl App {
 
     fn rebuild_visible(&mut self) {
         if self.query.is_empty() {
-            self.visible = (0..self.entries.len()).collect();
+            self.visible = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    (self.show_hidden || !is_hidden(entry.name.as_os_str())).then_some(index)
+                })
+                .collect();
             self.total_matches = self.visible.len();
         } else {
             let query_lower = self.query.to_lowercase();
@@ -730,6 +769,10 @@ fn project_root_for(path: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())
         .map(Path::to_path_buf)
+}
+
+fn is_hidden(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
 }
 
 #[cfg(test)]
@@ -852,6 +895,22 @@ mod tests {
         app.start_recursive_index();
 
         assert!(obsolete_scan.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hidden_files_can_be_toggled() {
+        let (_temp, mut app) = app_with_files(&["visible", ".hidden"]);
+        assert_eq!(app.visible.len(), 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+        let names: Vec<_> = app
+            .visible_entries()
+            .map(|entry| entry.display_name.as_str())
+            .collect();
+        assert_eq!(names, ["visible"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.visible.len(), 2);
     }
 
     #[test]

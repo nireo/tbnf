@@ -36,9 +36,9 @@ fn main() -> Result<()> {
     };
 
     let mut app = App::new(initial_dir, !args.no_preview)?;
-    let mut previewer = Previewer::new();
+    let previewer = Previewer::new();
     let mut terminal = TerminalSession::new().context("could not initialize terminal")?;
-    let exit = terminal.run(&mut app, &mut previewer);
+    let exit = terminal.run(&mut app, previewer);
     drop(terminal);
 
     if let Some(action) = exit? {

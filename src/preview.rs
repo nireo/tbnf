@@ -15,8 +15,6 @@ use syntect::{
     util::LinesWithEndings,
 };
 
-use crate::app::Entry;
-
 const MAX_FILE_SIZE: u64 = 50_000;
 const MAX_PREVIEW_BYTES: u64 = 10_000;
 
@@ -40,25 +38,25 @@ impl Previewer {
             .cloned()
             .unwrap_or_default();
         Self {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
+            syntaxes: two_face::syntax::extra_newlines(),
             theme,
         }
     }
 
-    pub fn load(&self, entry: Option<&Entry>) -> Preview {
-        let Some(entry) = entry else {
+    pub fn load_path(&self, path: &Path, is_dir: bool, max_lines: usize) -> Preview {
+        if max_lines == 0 {
             return Preview::default();
-        };
-        let lines = if entry.is_dir {
-            directory_lines(&entry.path)
+        }
+        let lines = if is_dir {
+            directory_lines(path, max_lines)
         } else {
-            self.file_lines(&entry.path)
+            self.file_lines(path, max_lines)
         }
         .unwrap_or_else(|error| vec![message_line(format!("*{error}*"))]);
         Preview { lines }
     }
 
-    fn file_lines(&self, path: &Path) -> io::Result<Vec<Line<'static>>> {
+    fn file_lines(&self, path: &Path, max_lines: usize) -> io::Result<Vec<Line<'static>>> {
         let metadata = fs::metadata(path)?;
         if metadata.len() > MAX_FILE_SIZE {
             return Ok(vec![message_line("*file too large*")]);
@@ -67,9 +65,10 @@ impl Previewer {
             return Ok(vec![message_line("*file empty*")]);
         }
 
-        let mut bytes = Vec::new();
+        let read_limit = metadata.len().min(MAX_PREVIEW_BYTES) as usize;
+        let mut bytes = Vec::with_capacity(read_limit);
         File::open(path)?
-            .take(MAX_PREVIEW_BYTES)
+            .take(read_limit as u64)
             .read_to_end(&mut bytes)?;
         if !looks_like_text(&bytes) {
             let mime =
@@ -88,8 +87,8 @@ impl Previewer {
             .flatten()
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
         let mut highlighter = HighlightLines::new(syntax, &self.theme);
-        let mut lines = Vec::new();
-        for source_line in LinesWithEndings::from(content) {
+        let mut lines = Vec::with_capacity(max_lines);
+        for source_line in LinesWithEndings::from(content).take(max_lines) {
             let highlighted = highlighter
                 .highlight_line(source_line, &self.syntaxes)
                 .unwrap_or_else(|_| Vec::new());
@@ -120,12 +119,12 @@ impl Previewer {
     }
 }
 
-fn directory_lines(path: &Path) -> io::Result<Vec<Line<'static>>> {
+fn directory_lines(path: &Path, max_lines: usize) -> io::Result<Vec<Line<'static>>> {
     let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     Ok(entries
         .into_iter()
-        .take(1_000)
+        .take(max_lines)
         .map(|entry| {
             let mut name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir())
@@ -157,7 +156,42 @@ fn message_line(message: impl Into<String>) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_text;
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::{Previewer, looks_like_text};
+
+    #[test]
+    fn extended_syntaxes_include_common_languages() {
+        let previewer = Previewer::new();
+
+        for (extension, expected_name) in [
+            ("ts", "TypeScript"),
+            ("tsx", "TypeScriptReact"),
+            ("kt", "Kotlin"),
+            ("ex", "Elixir"),
+            ("tf", "Terraform"),
+            ("zig", "Zig"),
+        ] {
+            let syntax = previewer
+                .syntaxes
+                .find_syntax_by_extension(extension)
+                .unwrap_or_else(|| panic!("missing syntax for .{extension}"));
+            assert_eq!(syntax.name, expected_name);
+        }
+    }
+
+    #[test]
+    fn preview_highlights_only_visible_lines() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("many.rs");
+        fs::write(&path, "let value = 1;\n".repeat(20)).unwrap();
+        let previewer = Previewer::new();
+
+        assert_eq!(previewer.load_path(&path, false, 3).lines.len(), 3);
+        assert!(previewer.load_path(&path, false, 0).lines.is_empty());
+    }
 
     #[test]
     fn text_detection_rejects_nulls_and_accepts_utf8() {

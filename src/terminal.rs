@@ -1,5 +1,7 @@
 use std::{
     io::{self, Stderr},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::Duration,
 };
 
@@ -11,10 +13,85 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    app::{App, AppCommand, ExitAction},
-    preview::Previewer,
+    app::{App, AppCommand, Entry, ExitAction},
+    preview::{Preview, Previewer},
     ui,
 };
+
+struct PreviewRequest {
+    generation: u64,
+    path: std::path::PathBuf,
+    is_dir: bool,
+    max_lines: usize,
+}
+
+struct PreviewResult {
+    generation: u64,
+    preview: Preview,
+}
+
+struct PreviewLoader {
+    request_tx: Sender<PreviewRequest>,
+    result_rx: Receiver<PreviewResult>,
+    generation: u64,
+}
+
+impl PreviewLoader {
+    fn new(previewer: Previewer) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<PreviewRequest>();
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(mut request) = request_rx.recv() {
+                while let Ok(newer_request) = request_rx.try_recv() {
+                    request = newer_request;
+                }
+                let preview = previewer.load_path(&request.path, request.is_dir, request.max_lines);
+                if result_tx
+                    .send(PreviewResult {
+                        generation: request.generation,
+                        preview,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            request_tx,
+            result_rx,
+            generation: 0,
+        }
+    }
+
+    fn request(&mut self, entry: Option<&Entry>, max_lines: usize) -> (u64, bool) {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let pending = entry.is_some_and(|entry| {
+            max_lines > 0
+                && self
+                    .request_tx
+                    .send(PreviewRequest {
+                        generation,
+                        path: entry.path.clone(),
+                        is_dir: entry.is_dir,
+                        max_lines,
+                    })
+                    .is_ok()
+        });
+        (generation, pending)
+    }
+
+    fn poll(&self, generation: u64) -> Option<Preview> {
+        let mut current = None;
+        while let Ok(result) = self.result_rx.try_recv() {
+            if result.generation == generation {
+                current = Some(result.preview);
+            }
+        }
+        current
+    }
+}
 
 pub struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stderr>>,
@@ -38,17 +115,25 @@ impl TerminalSession {
         }
     }
 
-    pub fn run(
-        &mut self,
-        app: &mut App,
-        previewer: &mut Previewer,
-    ) -> io::Result<Option<ExitAction>> {
-        let mut preview = previewer.load(app.selected_entry());
+    pub fn run(&mut self, app: &mut App, previewer: Previewer) -> io::Result<Option<ExitAction>> {
+        let mut loader = PreviewLoader::new(previewer);
+        let (mut preview_generation, mut preview_pending) =
+            self.request_preview(app, &mut loader)?;
+        let mut preview = Preview::default();
         let mut dirty = true;
         loop {
+            if let Some(loaded) = loader.poll(preview_generation) {
+                preview = loaded;
+                preview_pending = false;
+                dirty = true;
+            }
+
+            let selected_before_poll = app.selected_entry().map(|entry| entry.path.clone());
             if app.poll_index() {
-                if !app.query.is_empty() {
-                    preview = previewer.load(app.selected_entry());
+                let selected_after_poll = app.selected_entry().map(|entry| &entry.path);
+                if !app.query.is_empty() && selected_before_poll.as_ref() != selected_after_poll {
+                    (preview_generation, preview_pending) =
+                        self.request_preview(app, &mut loader)?;
                 }
                 dirty = true;
             }
@@ -56,7 +141,12 @@ impl TerminalSession {
                 self.terminal.draw(|frame| ui::draw(frame, app, &preview))?;
                 dirty = false;
             }
-            if !event::poll(Duration::from_millis(30))? {
+            let poll_timeout = if preview_pending {
+                Duration::from_millis(2)
+            } else {
+                Duration::from_millis(30)
+            };
+            if !event::poll(poll_timeout)? {
                 continue;
             }
             match event::read()? {
@@ -65,7 +155,8 @@ impl TerminalSession {
                     match app.handle_key(key) {
                         AppCommand::None => {}
                         AppCommand::RefreshPreview => {
-                            preview = previewer.load(app.selected_entry());
+                            (preview_generation, preview_pending) =
+                                self.request_preview(app, &mut loader)?;
                         }
                         AppCommand::Open(path) => {
                             if let Err(error) = open::that_detached(path) {
@@ -76,12 +167,23 @@ impl TerminalSession {
                     }
                 }
                 Event::Resize(_, _) => {
-                    preview = previewer.load(app.selected_entry());
+                    (preview_generation, preview_pending) =
+                        self.request_preview(app, &mut loader)?;
                     dirty = true;
                 }
                 _ => {}
             }
         }
+    }
+
+    fn request_preview(&self, app: &App, loader: &mut PreviewLoader) -> io::Result<(u64, bool)> {
+        let area = self.terminal.size()?;
+        let max_lines = if app.preview_enabled && area.width >= 70 {
+            area.height as usize
+        } else {
+            0
+        };
+        Ok(loader.request(app.selected_entry(), max_lines))
     }
 }
 
