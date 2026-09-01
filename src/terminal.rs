@@ -64,7 +64,12 @@ impl PreviewLoader {
         }
     }
 
-    fn request(&mut self, entry: Option<&Entry>, max_lines: usize) -> (u64, bool) {
+    fn request(
+        &mut self,
+        entry: Option<&Entry>,
+        cwd: &std::path::Path,
+        max_lines: usize,
+    ) -> (u64, bool) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let pending = entry.is_some_and(|entry| {
@@ -73,7 +78,7 @@ impl PreviewLoader {
                     .request_tx
                     .send(PreviewRequest {
                         generation,
-                        path: entry.path.clone(),
+                        path: entry.absolute_path(cwd),
                         is_dir: entry.is_dir,
                         max_lines,
                     })
@@ -128,10 +133,10 @@ impl TerminalSession {
                 dirty = true;
             }
 
-            let selected_before_poll = app.selected_entry().map(|entry| entry.path.clone());
+            let selected_before_poll = app.selected_relative_path().map(ToOwned::to_owned);
             if app.poll_index() {
-                let selected_after_poll = app.selected_entry().map(|entry| &entry.path);
-                if !app.query.is_empty() && selected_before_poll.as_ref() != selected_after_poll {
+                let selected_after_poll = app.selected_relative_path();
+                if !app.query.is_empty() && selected_before_poll.as_deref() != selected_after_poll {
                     (preview_generation, preview_pending) =
                         self.request_preview(app, &mut loader)?;
                 }
@@ -183,7 +188,7 @@ impl TerminalSession {
         } else {
             0
         };
-        Ok(loader.request(app.selected_entry(), max_lines))
+        Ok(loader.request(app.selected_entry(), &app.cwd, max_lines))
     }
 }
 

@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::Path,
+    sync::OnceLock,
 };
 
 use ratatui::{
@@ -24,23 +25,40 @@ pub struct Preview {
 }
 
 pub struct Previewer {
+    assets: OnceLock<PreviewAssets>,
+}
+
+struct PreviewAssets {
     syntaxes: SyntaxSet,
     theme: Theme,
 }
 
 impl Previewer {
     pub fn new() -> Self {
-        let themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .get("base16-ocean.dark")
-            .or_else(|| themes.themes.values().next())
-            .cloned()
-            .unwrap_or_default();
         Self {
-            syntaxes: two_face::syntax::extra_newlines(),
-            theme,
+            assets: OnceLock::new(),
         }
+    }
+
+    fn assets(&self) -> &PreviewAssets {
+        self.assets.get_or_init(|| {
+            let themes = ThemeSet::load_defaults();
+            let theme = themes
+                .themes
+                .get("base16-ocean.dark")
+                .or_else(|| themes.themes.values().next())
+                .cloned()
+                .unwrap_or_default();
+            PreviewAssets {
+                syntaxes: two_face::syntax::extra_newlines(),
+                theme,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn syntaxes(&self) -> &SyntaxSet {
+        &self.assets().syntaxes
     }
 
     pub fn load_path(&self, path: &Path, is_dir: bool, max_lines: usize) -> Preview {
@@ -80,17 +98,18 @@ impl Previewer {
             Err(_) => return Ok(vec![message_line("application/octet-stream")]),
         };
 
-        let syntax = self
+        let assets = self.assets();
+        let syntax = assets
             .syntaxes
             .find_syntax_for_file(path)
             .ok()
             .flatten()
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+            .unwrap_or_else(|| assets.syntaxes.find_syntax_plain_text());
+        let mut highlighter = HighlightLines::new(syntax, &assets.theme);
         let mut lines = Vec::with_capacity(max_lines);
         for source_line in LinesWithEndings::from(content).take(max_lines) {
             let highlighted = highlighter
-                .highlight_line(source_line, &self.syntaxes)
+                .highlight_line(source_line, &assets.syntaxes)
                 .unwrap_or_else(|_| Vec::new());
             let spans = highlighted
                 .into_iter()
@@ -175,7 +194,7 @@ mod tests {
             ("zig", "Zig"),
         ] {
             let syntax = previewer
-                .syntaxes
+                .syntaxes()
                 .find_syntax_by_extension(extension)
                 .unwrap_or_else(|| panic!("missing syntax for .{extension}"));
             assert_eq!(syntax.name, expected_name);
@@ -191,6 +210,17 @@ mod tests {
 
         assert_eq!(previewer.load_path(&path, false, 3).lines.len(), 3);
         assert!(previewer.load_path(&path, false, 0).lines.is_empty());
+    }
+
+    #[test]
+    fn directory_preview_does_not_load_highlighting_assets() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("file.txt"), "text").unwrap();
+        let previewer = Previewer::new();
+
+        assert!(previewer.assets.get().is_none());
+        assert_eq!(previewer.load_path(temp.path(), true, 10).lines.len(), 1);
+        assert!(previewer.assets.get().is_none());
     }
 
     #[test]

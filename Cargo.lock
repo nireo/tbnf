@@ -1740,6 +1740,7 @@ dependencies = [
  "dirs",
  "ignore",
  "infer",
+ "memchr",
  "nucleo-matcher",
  "open",
  "ratatui",

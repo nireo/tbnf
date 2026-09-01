@@ -1,13 +1,12 @@
 use std::{
     collections::BinaryHeap,
-    ffi::OsString,
     fs::{self, OpenOptions},
     io,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
 };
@@ -20,15 +19,27 @@ use nucleo_matcher::{
 };
 
 const INDEX_BATCH_SIZE: usize = 256;
+const INDEX_QUEUE_BATCHES: usize = 16;
 const MAX_INDEX_ENTRIES: usize = 500_000;
 const MAX_SEARCH_RESULTS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
-    pub name: OsString,
-    pub display_name: String,
-    pub path: PathBuf,
+    pub display_name: Box<str>,
+    relative_path: Box<Path>,
     pub is_dir: bool,
+}
+
+impl Entry {
+    fn file_name(&self) -> &std::ffi::OsStr {
+        self.relative_path
+            .file_name()
+            .unwrap_or(self.relative_path.as_os_str())
+    }
+
+    pub(crate) fn absolute_path(&self, cwd: &Path) -> PathBuf {
+        cwd.join(&self.relative_path)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -36,7 +47,7 @@ struct ScoredMatch {
     index: usize,
     rank: u8,
     fuzzy_score: u32,
-    path_lower: String,
+    path_lower: Box<str>,
 }
 
 impl Ord for ScoredMatch {
@@ -103,7 +114,7 @@ enum ScanMessage {
 struct BatchSender {
     generation: u64,
     entries: Vec<Entry>,
-    tx: Sender<ScanMessage>,
+    tx: SyncSender<ScanMessage>,
 }
 
 impl BatchSender {
@@ -151,14 +162,14 @@ pub struct App {
     viewport_height: usize,
     search_entries: Vec<Entry>,
     scan_generation: u64,
-    scan_tx: Sender<ScanMessage>,
+    scan_tx: SyncSender<ScanMessage>,
     scan_rx: Receiver<ScanMessage>,
     scan_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl App {
     pub fn new(cwd: PathBuf, preview_enabled: bool) -> io::Result<Self> {
-        let (scan_tx, scan_rx) = mpsc::channel();
+        let (scan_tx, scan_rx) = mpsc::sync_channel(INDEX_QUEUE_BATCHES);
         let mut app = Self {
             cwd: PathBuf::new(),
             entries: Vec::new(),
@@ -197,6 +208,16 @@ impl App {
             .and_then(|index| self.active_entries().get(*index))
     }
 
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.selected_entry()
+            .map(|entry| entry.absolute_path(&self.cwd))
+    }
+
+    pub fn selected_relative_path(&self) -> Option<&Path> {
+        self.selected_entry()
+            .map(|entry| entry.relative_path.as_ref())
+    }
+
     pub fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
         self.visible
             .iter()
@@ -233,13 +254,12 @@ impl App {
             };
             let name = dir_entry.file_name();
             entries.push(Entry {
-                display_name: name.to_string_lossy().into_owned(),
-                name,
-                path,
+                display_name: name.to_string_lossy().into_owned().into_boxed_str(),
+                relative_path: PathBuf::from(name).into_boxed_path(),
                 is_dir,
             });
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
         self.cwd = cwd;
         self.entries = entries;
@@ -329,25 +349,24 @@ impl App {
                     let Ok(walk_entry) = result else {
                         return WalkState::Continue;
                     };
-                    let path = walk_entry.path().to_path_buf();
+                    let path = walk_entry.path();
                     let Some(relative) = path.strip_prefix(&root).ok() else {
                         return WalkState::Continue;
                     };
-                    let Some(name) = path.file_name().map(ToOwned::to_owned) else {
+                    if path.file_name().is_none() {
                         return WalkState::Continue;
-                    };
+                    }
                     let file_type = walk_entry.file_type();
                     let is_symlink = file_type.is_some_and(|kind| kind.is_symlink());
                     let is_dir = file_type.is_some_and(|kind| kind.is_dir())
-                        || (is_symlink && fs::metadata(&path).is_ok_and(|target| target.is_dir()));
+                        || (is_symlink && fs::metadata(path).is_ok_and(|target| target.is_dir()));
 
                     if count.fetch_add(1, Ordering::Relaxed) >= MAX_INDEX_ENTRIES {
                         return WalkState::Quit;
                     }
                     batch.push(Entry {
-                        name,
-                        display_name: relative.to_string_lossy().into_owned(),
-                        path,
+                        display_name: relative.to_string_lossy().into_owned().into_boxed_str(),
+                        relative_path: relative.to_path_buf().into_boxed_path(),
                         is_dir,
                     });
                     WalkState::Continue
@@ -406,17 +425,19 @@ impl App {
             {
                 self.select()
             }
-            KeyCode::Enter => self.selected_entry().map_or_else(
-                || AppCommand::Exit(Some(ExitAction::ChangeDirectory(self.cwd.clone()))),
-                |entry| {
-                    let action = if entry.is_dir {
-                        ExitAction::ChangeDirectory(entry.path.clone())
-                    } else {
-                        self.edit_action(entry.path.clone())
-                    };
-                    AppCommand::Exit(Some(action))
-                },
-            ),
+            KeyCode::Enter => {
+                let Some(entry) = self.selected_entry() else {
+                    return AppCommand::Exit(Some(ExitAction::ChangeDirectory(self.cwd.clone())));
+                };
+                let is_dir = entry.is_dir;
+                let path = entry.absolute_path(&self.cwd);
+                let action = if is_dir {
+                    ExitAction::ChangeDirectory(path)
+                } else {
+                    self.edit_action(path)
+                };
+                AppCommand::Exit(Some(action))
+            }
             KeyCode::Backspace => {
                 self.backspace(false);
                 AppCommand::RefreshPreview
@@ -455,17 +476,15 @@ impl App {
                         label: format!("delete {}? (y/n): ", entry.display_name),
                         input: String::new(),
                         kind: PromptKind::Delete {
-                            target: entry.path.clone(),
+                            target: entry.absolute_path(&self.cwd),
                         },
                     });
                 }
                 AppCommand::None
             }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.selected_entry().map_or(AppCommand::None, |entry| {
-                    AppCommand::Open(entry.path.clone())
-                })
-            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => self
+                .selected_path()
+                .map_or(AppCommand::None, AppCommand::Open),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -584,14 +603,15 @@ impl App {
         let Some(entry) = self.selected_entry() else {
             return AppCommand::None;
         };
-        if entry.is_dir {
-            let path = entry.path.clone();
+        let is_dir = entry.is_dir;
+        let path = entry.absolute_path(&self.cwd);
+        if is_dir {
             if let Err(error) = self.switch_dir(path) {
                 self.status = Some(error.to_string());
             }
             AppCommand::RefreshPreview
         } else {
-            AppCommand::Exit(Some(self.edit_action(entry.path.clone())))
+            AppCommand::Exit(Some(self.edit_action(path)))
         }
     }
 
@@ -617,7 +637,7 @@ impl App {
         self.search_entries = self
             .entries
             .iter()
-            .filter(|entry| self.show_hidden || !is_hidden(entry.name.as_os_str()))
+            .filter(|entry| self.show_hidden || !is_hidden(entry.file_name()))
             .cloned()
             .collect();
     }
@@ -664,7 +684,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
-                    (self.show_hidden || !is_hidden(entry.name.as_os_str())).then_some(index)
+                    (self.show_hidden || !is_hidden(entry.file_name())).then_some(index)
                 })
                 .collect();
             self.total_matches = self.visible.len();
@@ -677,42 +697,66 @@ impl App {
                 AtomKind::Fuzzy,
             );
             let mut matcher = Matcher::new(Config::DEFAULT);
-            let mut scored = BinaryHeap::with_capacity(MAX_SEARCH_RESULTS + 1);
+            let mut scored: BinaryHeap<ScoredMatch> =
+                BinaryHeap::with_capacity(MAX_SEARCH_RESULTS + 1);
             let mut total_matches = 0;
+            let mut utf32_buffer = Vec::new();
+            let mut lowercase_buffer = Vec::new();
             for (index, entry) in self.search_entries.iter().enumerate() {
-                let mut buffer = Vec::new();
+                utf32_buffer.clear();
                 let score = pattern.score(
-                    Utf32Str::new(&entry.display_name, &mut buffer),
+                    Utf32Str::new(&entry.display_name, &mut utf32_buffer),
                     &mut matcher,
                 );
                 if let Some(fuzzy_score) = score {
                     total_matches += 1;
-                    let path_lower = entry.display_name.to_lowercase();
-                    let name_lower = entry.name.to_string_lossy().to_lowercase();
-                    let rank = if path_lower == query_lower || name_lower == query_lower {
-                        0
-                    } else if name_lower.starts_with(&query_lower) {
-                        1
-                    } else if name_lower.contains(&query_lower) {
-                        2
-                    } else if path_lower.starts_with(&query_lower)
-                        || path_lower.contains(&query_lower)
+                    let rank = match_rank(entry, &self.query, &query_lower, &mut lowercase_buffer);
+                    let core_order = scored.peek().map(|worst| {
+                        rank.cmp(&worst.rank)
+                            .then_with(|| worst.fuzzy_score.cmp(&fuzzy_score))
+                    });
+                    if scored.len() < MAX_SEARCH_RESULTS
+                        || core_order.is_some_and(std::cmp::Ordering::is_lt)
                     {
-                        3
-                    } else {
-                        4
-                    };
-                    let candidate = ScoredMatch {
-                        index,
-                        rank,
-                        fuzzy_score,
-                        path_lower,
-                    };
-                    if scored.len() < MAX_SEARCH_RESULTS {
-                        scored.push(candidate);
-                    } else if scored.peek().is_some_and(|worst| candidate < *worst) {
-                        scored.pop();
-                        scored.push(candidate);
+                        if scored.len() == MAX_SEARCH_RESULTS {
+                            scored.pop();
+                        }
+                        scored.push(ScoredMatch {
+                            index,
+                            rank,
+                            fuzzy_score,
+                            path_lower: entry.display_name.to_lowercase().into_boxed_str(),
+                        });
+                    } else if core_order.is_some_and(std::cmp::Ordering::is_eq) {
+                        let should_replace = scored.peek().is_some_and(|worst| {
+                            if self.query.is_ascii() && entry.display_name.is_ascii() {
+                                lowercase_buffer
+                                    .len()
+                                    .cmp(&worst.path_lower.len())
+                                    .then_with(|| {
+                                        lowercase_buffer.as_slice().cmp(worst.path_lower.as_bytes())
+                                    })
+                                    .then_with(|| index.cmp(&worst.index))
+                                    .is_lt()
+                            } else {
+                                let path_lower = entry.display_name.to_lowercase();
+                                path_lower
+                                    .len()
+                                    .cmp(&worst.path_lower.len())
+                                    .then_with(|| path_lower.as_str().cmp(&worst.path_lower))
+                                    .then_with(|| index.cmp(&worst.index))
+                                    .is_lt()
+                            }
+                        });
+                        if should_replace {
+                            scored.pop();
+                            scored.push(ScoredMatch {
+                                index,
+                                rank,
+                                fuzzy_score,
+                                path_lower: entry.display_name.to_lowercase().into_boxed_str(),
+                            });
+                        }
                     }
                 }
             }
@@ -726,13 +770,15 @@ impl App {
     }
 
     fn rebuild_visible_preserving_selection(&mut self) {
-        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        let selected_path = self
+            .selected_entry()
+            .map(|entry| entry.relative_path.clone());
         self.rebuild_visible();
         if let Some(selected_path) = selected_path
             && let Some(position) = self.visible.iter().position(|index| {
                 self.search_entries
                     .get(*index)
-                    .is_some_and(|entry| entry.path == selected_path)
+                    .is_some_and(|entry| entry.relative_path == selected_path)
             })
         {
             self.selected = position;
@@ -775,6 +821,51 @@ fn is_hidden(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with('.')
 }
 
+fn match_rank(entry: &Entry, query: &str, query_lower: &str, lowercase_buffer: &mut Vec<u8>) -> u8 {
+    let path = entry.display_name.as_ref();
+    if query.is_ascii() && path.is_ascii() {
+        lowercase_buffer.clear();
+        lowercase_buffer.extend_from_slice(path.as_bytes());
+        lowercase_buffer.make_ascii_lowercase();
+        let path_lower = lowercase_buffer.as_slice();
+        let name_lower = path_lower
+            .iter()
+            .rposition(|byte| *byte == std::path::MAIN_SEPARATOR as u8)
+            .map_or(path_lower, |position| &path_lower[position + 1..]);
+        let query_lower = query_lower.as_bytes();
+        if path_lower == query_lower || name_lower == query_lower {
+            0
+        } else if name_lower.starts_with(query_lower) {
+            1
+        } else if contains_bytes(name_lower, query_lower) {
+            2
+        } else if path_lower.starts_with(query_lower) || contains_bytes(path_lower, query_lower) {
+            3
+        } else {
+            4
+        }
+    } else {
+        let name = entry.file_name().to_string_lossy();
+        let path_lower = path.to_lowercase();
+        let name_lower = name.to_lowercase();
+        if path_lower == query_lower || name_lower == query_lower {
+            0
+        } else if name_lower.starts_with(query_lower) {
+            1
+        } else if name_lower.contains(query_lower) {
+            2
+        } else if path_lower.starts_with(query_lower) || path_lower.contains(query_lower) {
+            3
+        } else {
+            4
+        }
+    }
+}
+
+fn contains_bytes(value: &[u8], needle: &[u8]) -> bool {
+    memchr::memmem::find(value, needle).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, thread, time::Duration};
@@ -801,9 +892,22 @@ mod tests {
         }
         let names: Vec<_> = app
             .visible_entries()
-            .map(|entry| entry.display_name.as_str())
+            .map(|entry| entry.display_name.as_ref())
             .collect();
         assert_eq!(names, ["foo", "food", "xfoo", "far-out-object"]);
+    }
+
+    #[test]
+    fn ascii_search_ranking_remains_case_insensitive() {
+        let (_temp, mut app) = app_with_files(&["FOO", "FooBar", "xFoo", "far-out-object"]);
+        for character in "foo".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let names: Vec<_> = app
+            .visible_entries()
+            .map(|entry| entry.display_name.as_ref())
+            .collect();
+        assert_eq!(names, ["FOO", "FooBar", "xFoo", "far-out-object"]);
     }
 
     #[test]
@@ -862,7 +966,10 @@ mod tests {
         for character in "main.rs".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
-        assert_eq!(app.selected_entry().unwrap().display_name, "src/main.rs");
+        assert_eq!(
+            app.selected_entry().unwrap().display_name.as_ref(),
+            "src/main.rs"
+        );
     }
 
     #[test]
@@ -872,9 +979,8 @@ mod tests {
             .map(|index| {
                 let display_name = format!("file-{index:04}.rs");
                 Entry {
-                    name: OsString::from(&display_name),
-                    path: app.cwd.join(&display_name),
-                    display_name,
+                    relative_path: PathBuf::from(&display_name).into_boxed_path(),
+                    display_name: display_name.into_boxed_str(),
                     is_dir: false,
                 }
             })
@@ -884,7 +990,10 @@ mod tests {
 
         assert_eq!(app.visible.len(), MAX_SEARCH_RESULTS);
         assert_eq!(app.total_matches, MAX_SEARCH_RESULTS + 50);
-        assert_eq!(app.selected_entry().unwrap().display_name, "file-0000.rs");
+        assert_eq!(
+            app.selected_entry().unwrap().display_name.as_ref(),
+            "file-0000.rs"
+        );
     }
 
     #[test]
@@ -905,7 +1014,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
         let names: Vec<_> = app
             .visible_entries()
-            .map(|entry| entry.display_name.as_str())
+            .map(|entry| entry.display_name.as_ref())
             .collect();
         assert_eq!(names, ["visible"]);
 

@@ -103,11 +103,11 @@ fn draw_left(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default()
         };
         let row = Rect::new(list.x, list.y + offset as u16, list.width, 1);
-        frame.render_widget(Span::styled(entry.display_name.as_str(), style), row);
+        frame.render_widget(Span::styled(entry.display_name.as_ref(), style), row);
         if entry.is_dir {
             let slash_x = row
                 .x
-                .saturating_add(UnicodeWidthStr::width(entry.display_name.as_str()) as u16);
+                .saturating_add(UnicodeWidthStr::width(entry.display_name.as_ref()) as u16);
             if slash_x < row.right() {
                 frame.render_widget(Span::styled("/", style), Rect::new(slash_x, row.y, 1, 1));
             }
@@ -140,7 +140,7 @@ fn header_line<'a>(app: &'a App) -> Line<'a> {
     let mut spans = vec![Span::raw(cwd), Span::raw(app.query.as_str())];
     if let Some(entry) = app.selected_entry() {
         let remainder = if app.query.is_empty() {
-            Some(entry.display_name.as_str())
+            Some(entry.display_name.as_ref())
         } else if entry
             .display_name
             .to_lowercase()
