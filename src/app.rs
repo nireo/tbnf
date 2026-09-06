@@ -23,6 +23,28 @@ const INDEX_QUEUE_BATCHES: usize = 16;
 const MAX_INDEX_ENTRIES: usize = 500_000;
 const MAX_SEARCH_RESULTS: usize = 500;
 
+// Prune generated/dependency trees only during recursive indexing. Direct
+// directory browsing (including starting an index inside one) remains available.
+const SKIPPED_INDEX_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "vendor",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".cache",
+];
+
+fn skip_index_directory(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| SKIPPED_INDEX_DIRS.contains(&name))
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub display_name: Box<str>,
@@ -320,58 +342,80 @@ impl App {
         self.scan_cancel = Some(Arc::clone(&cancel));
         thread::spawn(move || {
             let count = Arc::new(AtomicUsize::new(0));
-            let mut builder = WalkBuilder::new(&root);
-            builder
-                .min_depth(Some(2))
-                .hidden(!show_hidden)
-                .filter_entry(|entry| {
-                    !entry.file_type().is_some_and(|kind| kind.is_dir())
-                        || !matches!(entry.file_name().to_str(), Some(".git" | ".hg" | ".svn"))
-                })
-                .follow_links(false)
-                .threads(available_scan_threads());
-            builder.build_parallel().run(|| {
-                let root = root.clone();
-                let count = Arc::clone(&count);
-                let cancel = Arc::clone(&cancel);
-                let mut batch = BatchSender {
-                    generation,
-                    entries: Vec::with_capacity(INDEX_BATCH_SIZE),
-                    tx: tx.clone(),
-                };
-                Box::new(move |result| {
-                    if cancel.load(Ordering::Acquire) {
-                        return WalkState::Quit;
-                    }
-                    if count.load(Ordering::Relaxed) >= MAX_INDEX_ENTRIES {
-                        return WalkState::Quit;
-                    }
-                    let Ok(walk_entry) = result else {
-                        return WalkState::Continue;
+            // Finish and flush visible results before spending the remaining
+            // index budget on hidden paths. Parallel traversal alone has no
+            // ordering guarantee.
+            for hidden_pass in [false, true] {
+                if (hidden_pass && !show_hidden)
+                    || cancel.load(Ordering::Acquire)
+                    || count.load(Ordering::Relaxed) >= MAX_INDEX_ENTRIES
+                {
+                    break;
+                }
+                let mut builder = WalkBuilder::new(&root);
+                builder
+                    .min_depth(Some(2))
+                    .hidden(!hidden_pass)
+                    .filter_entry(|entry| {
+                        entry.depth() == 0
+                            || !entry.file_type().is_some_and(|kind| kind.is_dir())
+                            || !skip_index_directory(entry.file_name())
+                    })
+                    .follow_links(false)
+                    .threads(available_scan_threads());
+                builder.build_parallel().run(|| {
+                    let root = root.clone();
+                    let count = Arc::clone(&count);
+                    let cancel = Arc::clone(&cancel);
+                    let mut batch = BatchSender {
+                        generation,
+                        entries: Vec::with_capacity(INDEX_BATCH_SIZE),
+                        tx: tx.clone(),
                     };
-                    let path = walk_entry.path();
-                    let Some(relative) = path.strip_prefix(&root).ok() else {
-                        return WalkState::Continue;
-                    };
-                    if path.file_name().is_none() {
-                        return WalkState::Continue;
-                    }
-                    let file_type = walk_entry.file_type();
-                    let is_symlink = file_type.is_some_and(|kind| kind.is_symlink());
-                    let is_dir = file_type.is_some_and(|kind| kind.is_dir())
-                        || (is_symlink && fs::metadata(path).is_ok_and(|target| target.is_dir()));
+                    Box::new(move |result| {
+                        if cancel.load(Ordering::Acquire) {
+                            return WalkState::Quit;
+                        }
+                        if count.load(Ordering::Relaxed) >= MAX_INDEX_ENTRIES {
+                            return WalkState::Quit;
+                        }
+                        let Ok(walk_entry) = result else {
+                            return WalkState::Continue;
+                        };
+                        let path = walk_entry.path();
+                        let Some(relative) = path.strip_prefix(&root).ok() else {
+                            return WalkState::Continue;
+                        };
+                        // The hidden pass traverses visible ancestors too, but
+                        // must not emit or count their entries a second time.
+                        if hidden_pass
+                            && !relative
+                                .components()
+                                .any(|part| is_hidden(part.as_os_str()))
+                        {
+                            return WalkState::Continue;
+                        }
+                        if path.file_name().is_none() {
+                            return WalkState::Continue;
+                        }
+                        let file_type = walk_entry.file_type();
+                        let is_symlink = file_type.is_some_and(|kind| kind.is_symlink());
+                        let is_dir = file_type.is_some_and(|kind| kind.is_dir())
+                            || (is_symlink
+                                && fs::metadata(path).is_ok_and(|target| target.is_dir()));
 
-                    if count.fetch_add(1, Ordering::Relaxed) >= MAX_INDEX_ENTRIES {
-                        return WalkState::Quit;
-                    }
-                    batch.push(Entry {
-                        display_name: relative.to_string_lossy().into_owned().into_boxed_str(),
-                        relative_path: relative.to_path_buf().into_boxed_path(),
-                        is_dir,
-                    });
-                    WalkState::Continue
-                })
-            });
+                        if count.fetch_add(1, Ordering::Relaxed) >= MAX_INDEX_ENTRIES {
+                            return WalkState::Quit;
+                        }
+                        batch.push(Entry {
+                            display_name: relative.to_string_lossy().into_owned().into_boxed_str(),
+                            relative_path: relative.to_path_buf().into_boxed_path(),
+                            is_dir,
+                        });
+                        WalkState::Continue
+                    })
+                });
+            }
             let truncated = count.load(Ordering::Relaxed) >= MAX_INDEX_ENTRIES;
             if !cancel.load(Ordering::Acquire) {
                 let _ = tx.send(ScanMessage::Done {
@@ -969,6 +1013,83 @@ mod tests {
         assert_eq!(
             app.selected_entry().unwrap().display_name.as_ref(),
             "src/main.rs"
+        );
+    }
+
+    fn finish_index(app: &mut App) {
+        for _ in 0..400 {
+            app.poll_index();
+            if !app.indexing {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("recursive index did not finish");
+    }
+
+    #[test]
+    fn visible_paths_are_indexed_before_hidden_paths_without_duplicates() {
+        let temp = TempDir::new().unwrap();
+        for name in ["src/visible.rs", ".config/settings", "src/.hidden/file"] {
+            let path = temp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "test").unwrap();
+        }
+        let mut app = App::new(temp.path().to_path_buf(), true).unwrap();
+        finish_index(&mut app);
+        let paths: Vec<_> = app
+            .search_entries
+            .iter()
+            .map(|entry| entry.display_name.as_ref())
+            .collect();
+        let visible = paths
+            .iter()
+            .position(|path| *path == "src/visible.rs")
+            .unwrap();
+        for hidden in [".config/settings", "src/.hidden/file"] {
+            assert!(visible < paths.iter().position(|path| *path == hidden).unwrap());
+        }
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len());
+
+        app.toggle_hidden();
+        finish_index(&mut app);
+        assert!(app.search_entries.iter().all(|entry| {
+            !entry
+                .relative_path
+                .components()
+                .any(|part| is_hidden(part.as_os_str()))
+        }));
+    }
+
+    #[test]
+    fn generated_directories_are_pruned_but_can_be_opened_directly() {
+        let temp = TempDir::new().unwrap();
+        for name in SKIPPED_INDEX_DIRS {
+            let dir = temp.path().join("project").join(name).join("nested");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("generated.txt"), "test").unwrap();
+        }
+        let mut app = App::new(temp.path().to_path_buf(), true).unwrap();
+        finish_index(&mut app);
+        assert!(
+            !app.search_entries
+                .iter()
+                .any(|entry| entry.display_name.contains("generated.txt"))
+        );
+
+        app.switch_dir(temp.path().join("project")).unwrap();
+        assert!(
+            app.entries
+                .iter()
+                .any(|entry| entry.display_name.as_ref() == "target")
+        );
+        app.switch_dir(temp.path().join("project/target")).unwrap();
+        finish_index(&mut app);
+        assert!(
+            app.search_entries
+                .iter()
+                .any(|entry| entry.display_name.as_ref() == "nested/generated.txt")
         );
     }
 
