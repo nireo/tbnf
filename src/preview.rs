@@ -95,6 +95,10 @@ impl Previewer {
         }
         let content = match std::str::from_utf8(&bytes) {
             Ok(content) => content,
+            // A bounded read may end partway through a valid UTF-8 character.
+            Err(error) if error.error_len().is_none() && metadata.len() > bytes.len() as u64 => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid UTF-8 prefix")
+            }
             Err(_) => return Ok(vec![message_line("application/octet-stream")]),
         };
 
@@ -110,7 +114,7 @@ impl Previewer {
         for source_line in LinesWithEndings::from(content).take(max_lines) {
             let highlighted = highlighter
                 .highlight_line(source_line, &assets.syntaxes)
-                .unwrap_or_else(|_| Vec::new());
+                .unwrap_or_default();
             let spans = highlighted
                 .into_iter()
                 .map(|(style, text)| {
@@ -210,6 +214,25 @@ mod tests {
 
         assert_eq!(previewer.load_path(&path, false, 3).lines.len(), 3);
         assert!(previewer.load_path(&path, false, 0).lines.is_empty());
+    }
+
+    #[test]
+    fn preview_accepts_utf8_split_at_the_read_limit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("text.txt");
+        let content = format!("{}é\n", "a".repeat(super::MAX_PREVIEW_BYTES as usize - 1));
+        fs::write(&path, content).unwrap();
+        let preview = Previewer::new().load_path(&path, false, 1);
+        assert!(preview.lines[0].to_string().starts_with("aaa"));
+    }
+
+    #[test]
+    fn preview_rejects_invalid_utf8_in_a_complete_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("invalid.txt");
+        fs::write(&path, b"text\xc3").unwrap();
+        let preview = Previewer::new().load_path(&path, false, 1);
+        assert_eq!(preview.lines[0].to_string(), "application/octet-stream");
     }
 
     #[test]

@@ -687,6 +687,11 @@ impl App {
     }
 
     fn backspace(&mut self, full_query: bool) {
+        if full_query {
+            self.query.clear();
+            self.rebuild_visible();
+            return;
+        }
         if self.query.is_empty() {
             if let Some(parent) = self.cwd.parent().map(Path::to_path_buf)
                 && parent != self.cwd
@@ -696,11 +701,7 @@ impl App {
             }
             return;
         }
-        if full_query {
-            self.query.clear();
-        } else {
-            self.query.pop();
-        }
+        self.query.pop();
         self.rebuild_visible();
     }
 
@@ -974,6 +975,15 @@ mod tests {
     }
 
     #[test]
+    fn clearing_an_empty_query_stays_in_the_current_directory() {
+        let (_temp, mut app) = app_with_files(&[]);
+        let cwd = app.cwd.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.cwd, cwd);
+        assert!(app.query.is_empty());
+    }
+
+    #[test]
     fn create_does_not_truncate_an_existing_file() {
         let (temp, mut app) = app_with_files(&["existing"]);
         let error = app.create("existing").unwrap_err();
@@ -999,14 +1009,7 @@ mod tests {
         fs::create_dir(temp.path().join("src")).unwrap();
         fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         let mut app = App::new(temp.path().to_path_buf(), true).unwrap();
-        for _ in 0..200 {
-            app.poll_index();
-            if !app.indexing {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!app.indexing, "recursive index did not finish");
+        finish_index(&mut app);
         for character in "main.rs".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }

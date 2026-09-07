@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "A fast fuzzy terminal file navigator"
 license = "MIT"
+repository = "https://github.com/nireo/tbnf"
+readme = "README.md"
+keywords = ["terminal", "file-manager", "fuzzy", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "install.sh"]
 
 [dependencies]
 anyhow = "1"
